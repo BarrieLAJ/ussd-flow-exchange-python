@@ -10,13 +10,18 @@ Deploy to Vercel as a Python serverless function.
 import os
 import json
 import base64
-import struct
-from http.server import BaseHTTPRequestHandler
+from flask import Flask, request, jsonify, make_response
 
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+
+# ---------------------------------------------------------------------------
+# Flask app
+# ---------------------------------------------------------------------------
+app = Flask(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -159,97 +164,80 @@ def handle_exchange(exchange_request: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 4. Vercel serverless handler
+# 4. Routes
 # ---------------------------------------------------------------------------
 
-class handler(BaseHTTPRequestHandler):
-    """Vercel Python serverless function handler."""
+@app.route("/api/exchange", methods=["GET"])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({
+        "status": "ok",
+        "language": "python",
+        "service": "ussd-flow-exchange",
+        "encryption": "RSA-OAEP-SHA256 + AES-128-GCM",
+        "key_loaded": private_key is not None,
+    })
 
-    def do_POST(self):
-        try:
-            # Read request body
-            content_length = int(self.headers.get("Content-Length", 0))
-            raw_body = self.rfile.read(content_length).decode("utf-8")
 
-            # Parse JSON
-            try:
-                body = json.loads(raw_body)
-            except json.JSONDecodeError:
-                self._send_error(400, "Invalid JSON")
-                return
+@app.route("/api/exchange", methods=["POST"])
+def exchange():
+    """Main exchange endpoint."""
+    try:
+        body = request.get_json(force=True)
+        if body is None:
+            return jsonify({"action": "stop", "message": "Invalid JSON"}), 400
 
-            # Check if request is encrypted
-            is_encrypted = (
-                isinstance(body, dict)
-                and "encryptedAesKey" in body
-                and "encryptedExchangeData" in body
-                and isinstance(body["encryptedAesKey"], str)
-                and isinstance(body["encryptedExchangeData"], str)
-            )
-
-            aes_key = None
-            exchange_request = None
-
-            if is_encrypted and private_key:
-                # Encrypted request path
-                try:
-                    aes_key, exchange_request = decrypt_request(body)
-                    print(f"[Exchange] Decryption OK — session: {exchange_request.get('global', {}).get('sessionId', 'N/A')}, page: {exchange_request.get('currentPage', 'N/A')}")
-                except Exception as e:
-                    print(f"[Exchange] Decryption FAILED: {e}")
-                    self._send_error(400, "Decryption failed")
-                    return
-
-            elif (
-                isinstance(body, dict)
-                and "currentPage" in body
-                and "global" in body
-            ):
-                # Plain-text request path
-                exchange_request = body
-                print(f"[Exchange] Plain request — session: {exchange_request.get('global', {}).get('sessionId', 'N/A')}, page: {exchange_request.get('currentPage', 'N/A')}")
-
-            else:
-                self._send_error(400, "Invalid request body")
-                return
-
-            # Process the exchange
-            response = handle_exchange(exchange_request)
-
-            # Send response
-            if aes_key:
-                # Encrypt the response
-                encrypted = encrypt_response(response, aes_key)
-                self._send_response(200, encrypted, "text/plain")
-            else:
-                self._send_response(200, json.dumps(response), "application/json")
-
-        except Exception as e:
-            print(f"[Exchange] Unhandled error: {e}")
-            import traceback
-            traceback.print_exc()
-            self._send_error(500, "Internal server error")
-
-    def do_GET(self):
-        """Health check endpoint."""
-        self._send_response(
-            200,
-            json.dumps({
-                "status": "ok",
-                "language": "python",
-                "service": "ussd-flow-exchange",
-                "encryption": "RSA-OAEP-SHA256 + AES-128-GCM",
-                "key_loaded": private_key is not None,
-            }),
-            "application/json",
+        # Check if request is encrypted
+        is_encrypted = (
+            isinstance(body, dict)
+            and "encryptedAesKey" in body
+            and "encryptedExchangeData" in body
+            and isinstance(body.get("encryptedAesKey"), str)
+            and isinstance(body.get("encryptedExchangeData"), str)
         )
 
-    def _send_response(self, status: int, body: str, content_type: str):
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.end_headers()
-        self.wfile.write(body.encode("utf-8"))
+        aes_key = None
+        exchange_request = None
 
-    def _send_error(self, status: int, message: str):
-        error_response = {"action": "stop", "message": message}
-        self._send_response(status, json.dumps(error_response), "application/json")
+        if is_encrypted and private_key:
+            # Encrypted request path
+            try:
+                aes_key, exchange_request = decrypt_request(body)
+                session_id = exchange_request.get("global", {}).get("sessionId", "N/A")
+                page = exchange_request.get("currentPage", "N/A")
+                print(f"[Exchange] Decryption OK — session: {session_id}, page: {page}")
+            except Exception as e:
+                print(f"[Exchange] Decryption FAILED: {e}")
+                return jsonify({"action": "stop", "message": "Decryption failed"}), 400
+
+        elif (
+            isinstance(body, dict)
+            and "currentPage" in body
+            and "global" in body
+        ):
+            # Plain-text request path
+            exchange_request = body
+            page = exchange_request.get("currentPage", "N/A")
+            print(f"[Exchange] Plain request — page: {page}")
+
+        else:
+            return jsonify({"action": "stop", "message": "Invalid request body"}), 400
+
+        # Process the exchange
+        response = handle_exchange(exchange_request)
+
+        # Send response
+        if aes_key:
+            # Encrypt the response
+            encrypted = encrypt_response(response, aes_key)
+            resp = make_response(encrypted, 200)
+            resp.headers["Content-Type"] = "text/plain"
+            return resp
+        else:
+            return jsonify(response)
+
+    except Exception as e:
+        print(f"[Exchange] Unhandled error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"action": "stop", "message": "Internal server error"}), 500
